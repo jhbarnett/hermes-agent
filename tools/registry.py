@@ -80,6 +80,10 @@ class ToolRegistry:
         if check_fn and toolset not in self._toolset_checks:
             self._toolset_checks[toolset] = check_fn
 
+    def unregister(self, name: str) -> Optional["ToolEntry"]:
+        """Remove a tool by name.  Returns the removed entry, or None."""
+        return self._tools.pop(name, None)
+
     # ------------------------------------------------------------------
     # Schema retrieval
     # ------------------------------------------------------------------

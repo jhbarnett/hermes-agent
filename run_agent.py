@@ -2032,6 +2032,33 @@ class AIAgent:
             tool["function"]["name"] for tool in self.tools
         } if self.tools else set()
 
+    def _apply_mcp_session_filter(self) -> None:
+        """Filter self.tools to only include MCP tools activated in this session.
+
+        Parallel sessions each see only ``search_mcp_tools`` + their own
+        activated tools.  Non-MCP tools are never filtered.  Subagents
+        (``_mcp_session_id is None``) inherit the parent's filter via the
+        ``task_id`` passed to their ``run_conversation()`` call (which is
+        ``None``, so they skip filtering and keep whatever the parent had).
+        """
+        session_id = getattr(self, "_mcp_session_id", None)
+        if not session_id:
+            return  # subagent or no session — don't filter
+        try:
+            from tools.mcp_tool import get_session_filter
+            allowed = get_session_filter(session_id)
+        except ImportError:
+            return
+        if allowed is None:
+            return  # deferred loading not active
+
+        self.tools = [
+            t for t in self.tools
+            if not t["function"]["name"].startswith("mcp_")
+            or t["function"]["name"] == "search_mcp_tools"
+            or t["function"]["name"] in allowed
+        ]
+
     def _activate_honcho(
         self,
         hcfg,
@@ -5438,7 +5465,18 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
-        
+
+        # Session-scoped deferred MCP tools: filter the tool surface to
+        # only include MCP tools activated in THIS session.  Each parallel
+        # session (thread, cron, background agent) sees only its own tools.
+        # Subagents (no task_id) inherit the parent session's filter.
+        self._mcp_session_id = task_id  # None for subagents
+        if task_id:
+            self._apply_mcp_session_filter()
+            self.valid_tool_names = {
+                tool["function"]["name"] for tool in self.tools
+            } if self.tools else set()
+
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
@@ -6821,6 +6859,26 @@ class AIAgent:
 
                     _msg_count_before_tools = len(messages)
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                    # Rebuild tool surface if deferred MCP tools were activated
+                    # (e.g. via search_mcp_tools).  This must happen before the
+                    # next API call so newly-activated tools appear in the
+                    # request's tool list.
+                    try:
+                        from tools.mcp_tool import check_tools_dirty
+                        if check_tools_dirty():
+                            self.tools = get_tool_definitions(
+                                enabled_toolsets=self.enabled_toolsets,
+                                disabled_toolsets=self.disabled_toolsets,
+                                quiet_mode=True,
+                            )
+                            self._apply_mcp_session_filter()
+                            self.valid_tool_names = {
+                                tool["function"]["name"] for tool in self.tools
+                            } if self.tools else set()
+                            self._vprint(f"{self.log_prefix}🔧 Tool surface updated ({len(self.tools)} tools)")
+                    except ImportError:
+                        pass
 
                     # Signal that a paragraph break is needed before the next
                     # streamed text.  We don't emit it immediately because

@@ -33,6 +33,10 @@ mcp_servers:
       exclude: []
       resources: true
       prompts: true
+
+mcp_tool_search:          # deferred tool loading
+  enabled: auto           # auto | true | false
+  threshold: 20           # tool count trigger for auto mode
 ```
 
 ## Server keys
@@ -126,6 +130,70 @@ So this is normal:
 - you enable prompts
 - but no prompt utilities appear
 - because the server does not support prompts
+
+## Deferred tool loading (Tool Search)
+
+When many MCP tools are configured, their schemas can consume a large portion of the context window on every API call. Hermes can automatically defer MCP tools and expose a single `search_mcp_tools` meta-tool instead. The agent uses it to discover and activate only the tools it needs.
+
+### How it works
+
+1. All MCP servers connect and discover tools at startup (unchanged)
+2. If the total MCP tool count exceeds the threshold, all MCP tools are deferred
+3. A `search_mcp_tools` tool is registered in their place
+4. The agent calls `search_mcp_tools(query="stripe payments")` to find relevant tools
+5. Matched tools are activated and available from the next turn onward
+6. Activated tools persist for the current session (reset on new thread, `/reset`, or cron job)
+
+### Config
+
+```yaml
+mcp_tool_search:
+  enabled: auto    # auto | true | false (default: auto)
+  threshold: 20    # only used in auto mode (default: 20)
+```
+
+| Value | Behavior |
+|---|---|
+| `auto` | Defer when total MCP tools exceed `threshold` |
+| `true` | Always defer, regardless of tool count |
+| `false` | Never defer (all tools loaded upfront, original behavior) |
+
+### Search scoring
+
+`search_mcp_tools` uses word-boundary-aware keyword matching. Tool names are split on `_` into words, and each query term is scored:
+
+| Match type | Name weight | Description weight |
+|---|---|---|
+| Exact word | 5 | 2 |
+| Word prefix (≥3 chars) | 4 | 1 |
+| Substring | 2 | 1 |
+
+Only the top `max_results` (default 5) tools are activated per search call. Multi-term queries accumulate scores, so `"stripe list"` strongly favors `mcp_stripe_list_customers` over `mcp_github_list_repos`.
+
+### Session scoping
+
+Activated tools are scoped to the current session. Each parallel session (Discord thread, cron job, background agent) maintains its own set of activated tools — tools activated in one session do not appear in another session's context.
+
+Subagents spawned via `delegate_task` inherit the parent session's activated tools.
+
+Within a session, activated tools persist across multiple messages — the agent does not need to re-search between turns in the same conversation.
+
+The gateway can optionally call `cleanup_session(session_id)` when a session expires to free registry entries for tools no longer referenced by any active session.
+
+### Example
+
+With 260 MCP tools across 6 servers:
+
+```
+# Before: every API call sends 260 tool schemas (~80k+ tokens)
+# After:  most calls send ~20 built-in tools + search_mcp_tools
+
+Agent: search_mcp_tools(query="stripe customers")
+→ Activates: mcp_stripe_list_customers, mcp_stripe_create_customer, ...
+
+Agent: mcp_stripe_list_customers(limit=10)
+→ Works normally — tool is now in the active set
+```
 
 ## `enabled: false`
 
