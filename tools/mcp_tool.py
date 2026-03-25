@@ -121,6 +121,11 @@ except ImportError:
 
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
+
+# Deferred tool loading: when total MCP tools exceed this threshold,
+# tools are deferred and a search_mcp_tools meta-tool is registered instead.
+# Set to 0 to always defer, or a very high number to never defer.
+_DEFAULT_TOOL_SEARCH_THRESHOLD = 20
 _MAX_RECONNECT_RETRIES = 5
 _MAX_BACKOFF_SECONDS = 60
 
@@ -905,6 +910,18 @@ _mcp_thread: Optional[threading.Thread] = None
 # Protects _mcp_loop, _mcp_thread, and _servers from concurrent access.
 _lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Deferred tool loading state (ToolSearch pattern)
+# ---------------------------------------------------------------------------
+# When enabled, MCP tools are not registered in the main registry. Instead
+# they are stored here and a single ``search_mcp_tools`` meta-tool is
+# registered.  The agent uses it to discover and activate tools on demand,
+# keeping per-request token usage low.
+
+_deferred_tools: Dict[str, dict] = {}   # prefixed_name -> {schema, handler, check_fn, toolset, description}
+_session_activated: Dict[str, set] = {} # session_id -> set of tool names activated in that session
+_tools_dirty: bool = False              # flag: run_agent should rebuild self.tools
+
 
 def _ensure_mcp_loop():
     """Start the background event loop thread if not already running."""
@@ -1486,6 +1503,425 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+# ---------------------------------------------------------------------------
+# Deferred tool loading (ToolSearch pattern)
+# ---------------------------------------------------------------------------
+
+def _load_tool_search_config() -> dict:
+    """Load ``mcp_tool_search`` settings from config.
+
+    Returns dict with keys ``enabled`` (``"auto"``/``True``/``False``) and
+    ``threshold`` (int).
+    """
+    defaults = {"enabled": "auto", "threshold": _DEFAULT_TOOL_SEARCH_THRESHOLD}
+    try:
+        from hermes_cli.config import load_config
+        raw = load_config().get("mcp_tool_search") or {}
+    except Exception:
+        return defaults
+    enabled = raw.get("enabled", "auto")
+    if isinstance(enabled, str) and enabled.lower() == "auto":
+        enabled = "auto"
+    else:
+        enabled = _parse_boolish(enabled, default=True)
+    threshold = int(raw.get("threshold", _DEFAULT_TOOL_SEARCH_THRESHOLD))
+    return {"enabled": enabled, "threshold": threshold}
+
+
+def _should_defer_tools(mcp_tool_count: int) -> bool:
+    """Decide whether to defer MCP tools based on config and tool count."""
+    cfg = _load_tool_search_config()
+    enabled = cfg["enabled"]
+    if enabled is True:
+        return True
+    if enabled is False:
+        return False
+    # auto: defer when total exceeds threshold
+    return mcp_tool_count > cfg["threshold"]
+
+
+def _defer_all_mcp_tools() -> int:
+    """Move all registered MCP tools into deferred storage.
+
+    Unregisters them from the main registry and removes them from toolsets.
+    Returns the number of tools deferred.
+    """
+    from tools.registry import registry
+    from toolsets import TOOLSETS
+
+    all_mcp_names = _existing_tool_names()
+    if not all_mcp_names:
+        return 0
+
+    count = 0
+    for name in all_mcp_names:
+        entry = registry.unregister(name)
+        if entry:
+            _deferred_tools[name] = {
+                "schema": entry.schema,
+                "handler": entry.handler,
+                "check_fn": entry.check_fn,
+                "toolset": entry.toolset,
+                "description": entry.description or entry.schema.get("description", ""),
+            }
+            count += 1
+
+    # Clean toolsets: remove mcp-* and bare server name entries,
+    # purge MCP tool names from hermes-* umbrella sets.
+    mcp_name_set = set(all_mcp_names)
+    to_delete = []
+    for ts_name, ts in TOOLSETS.items():
+        desc = str(ts.get("description", ""))
+        if desc.startswith("MCP tools from ") or desc.startswith("MCP server '"):
+            to_delete.append(ts_name)
+        elif ts_name.startswith("hermes-"):
+            ts["tools"] = [t for t in ts["tools"] if t not in mcp_name_set]
+    for ts_name in to_delete:
+        del TOOLSETS[ts_name]
+
+    # Clear _registered_tool_names on servers so _existing_tool_names()
+    # returns empty (tools are now in _deferred_tools, not registry).
+    for server in _servers.values():
+        if hasattr(server, "_registered_tool_names"):
+            server._registered_tool_names = []
+
+    logger.info("Deferred %d MCP tool(s) — search_mcp_tools will be used for discovery", count)
+    return count
+
+
+def _score_term(term: str, words: List[str], text: str) -> int:
+    """Score a single search term against a word list and raw text.
+
+    Scoring tiers (highest wins per field):
+      - Exact word match  → 3  (``term`` equals a word)
+      - Word prefix match → 2  (a word starts with ``term``, len ≥ 3)
+      - Substring match   → 1  (``term`` appears anywhere in ``text``)
+      - No match          → 0
+
+    Only the highest tier is awarded per field — they don't stack.
+    """
+    # Exact word
+    if term in words:
+        return 3
+    # Prefix (only for terms ≥ 3 chars to avoid noisy single-letter hits)
+    if len(term) >= 3 and any(w.startswith(term) for w in words):
+        return 2
+    # Substring fallback
+    if term in text:
+        return 1
+    return 0
+
+
+def _search_deferred_tools(query: str, max_results: int = 5) -> List[dict]:
+    """Keyword search over deferred tools.  Returns list of match dicts.
+
+    Tool names are split on ``_`` into words so that search terms are
+    scored with word-boundary awareness.  This prevents generic terms
+    like ``"read"`` from drowning out server-specific matches.
+
+    Scoring per term:
+      - Name:  exact word ×5, prefix ×4, substring ×2
+      - Desc:  exact word ×2, prefix ×1, substring ×1
+
+    Name matches are weighted higher so the model's natural queries
+    (``"stripe payments"``) rank the right server's tools first.
+    """
+    if not query or not _deferred_tools:
+        return []
+
+    terms = query.lower().split()
+    scored: List[tuple] = []
+
+    for name, info in _deferred_tools.items():
+        name_lower = name.lower()
+        name_words = name_lower.split("_")
+        desc_lower = info.get("description", "").lower()
+        desc_words = desc_lower.split()
+
+        score = 0
+        for term in terms:
+            # Name scoring (high weight — server + action are in the name)
+            ns = _score_term(term, name_words, name_lower)
+            if ns == 3:       # exact word in name
+                score += 5
+            elif ns == 2:     # prefix in name
+                score += 4
+            elif ns == 1:     # substring in name
+                score += 2
+
+            # Description scoring (lower weight)
+            ds = _score_term(term, desc_words, desc_lower)
+            if ds == 3:       # exact word in description
+                score += 2
+            elif ds >= 1:     # prefix or substring in description
+                score += 1
+
+        if score > 0:
+            scored.append((score, name, info))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [{"name": n, **i} for _, n, i in scored[:max_results]]
+
+
+def _all_activated_tools() -> set:
+    """Return the union of all per-session activated tool names."""
+    result: set = set()
+    for names in _session_activated.values():
+        result.update(names)
+    return result
+
+
+def _activate_tools(tool_names: List[str], session_id: Optional[str] = None) -> List[str]:
+    """Move tools from deferred storage to the live registry + toolsets.
+
+    *session_id* associates the activation with a gateway session so that
+    ``get_session_filter`` can scope each session's tool surface.  When
+    ``None`` (e.g. called from tests), activations are recorded in a
+    default ``"_global"`` bucket.
+
+    Tools are registered in the global registry (so any session CAN
+    dispatch them) but only sessions that activated them will have them
+    in their filtered tool list.
+
+    Returns list of tool names that were actually activated (new this call).
+    """
+    global _tools_dirty
+    from tools.registry import registry
+    from toolsets import TOOLSETS, create_custom_toolset
+
+    bucket = session_id or "_global"
+
+    with _lock:
+        session_set = _session_activated.setdefault(bucket, set())
+        already_registered = _all_activated_tools()
+
+        activated: List[str] = []
+        newly_registered: List[str] = []
+        toolset_additions: Dict[str, List[str]] = {}
+
+        for name in tool_names:
+            if name in session_set:
+                continue  # already activated in this session
+            info = _deferred_tools.get(name)
+            if not info:
+                continue
+
+            session_set.add(name)
+            activated.append(name)
+
+            # Only register in the global registry if no other session has it yet
+            if name not in already_registered:
+                registry.register(
+                    name=name,
+                    toolset=info["toolset"],
+                    schema=info["schema"],
+                    handler=info["handler"],
+                    check_fn=info.get("check_fn"),
+                    is_async=False,
+                    description=info.get("description", ""),
+                )
+                newly_registered.append(name)
+                ts = info["toolset"]
+                toolset_additions.setdefault(ts, []).append(name)
+
+    # Toolset updates outside the lock (TOOLSETS has its own access patterns)
+    for ts_name, tools in toolset_additions.items():
+        existing_ts = TOOLSETS.get(ts_name)
+        if existing_ts:
+            existing_ts["tools"].extend(tools)
+        else:
+            create_custom_toolset(
+                name=ts_name,
+                description=f"MCP tools (activated via search)",
+                tools=tools,
+            )
+        for umbrella_name, umbrella_ts in TOOLSETS.items():
+            if umbrella_name.startswith("hermes-"):
+                for tool_name in tools:
+                    if tool_name not in umbrella_ts["tools"]:
+                        umbrella_ts["tools"].append(tool_name)
+
+    if activated:
+        _tools_dirty = True
+        logger.info("Activated %d deferred MCP tool(s) for session %s: %s",
+                     len(activated), bucket, ", ".join(activated))
+
+    return activated
+
+
+def _register_search_tool() -> None:
+    """Register the ``search_mcp_tools`` meta-tool in the main registry."""
+    from tools.registry import registry
+    from toolsets import TOOLSETS
+
+    schema = {
+        "name": "search_mcp_tools",
+        "description": (
+            "Search for available MCP tools by keyword. Returns matching tool "
+            "names, descriptions, and parameter schemas. Matched tools are "
+            "automatically activated and available for use in your next response."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Keywords to search tool names and descriptions "
+                        "(e.g., 'stripe payments', 'github pull requests', 'posthog analytics')"
+                    ),
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default: 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["query"],
+        },
+    }
+
+    def _handler(args: dict, **kwargs) -> str:
+        query = args.get("query", "")
+        max_results = args.get("max_results", 5)
+
+        matches = _search_deferred_tools(query, max_results)
+        if not matches:
+            return json.dumps({
+                "tools": [],
+                "total_deferred": len(_deferred_tools),
+                "note": f"No tools matched '{query}'. Try different keywords.",
+            })
+
+        # Activate matched tools (scoped to the calling session via task_id)
+        matched_names = [m["name"] for m in matches]
+        _activate_tools(matched_names, session_id=kwargs.get("task_id"))
+
+        # Return full schemas so the model knows what parameters to use
+        tool_defs = []
+        for m in matches:
+            tool_defs.append({
+                "name": m["name"],
+                "description": m.get("description", ""),
+                "parameters": m["schema"].get("parameters", {}),
+            })
+
+        return json.dumps({
+            "tools": tool_defs,
+            "activated": len(matched_names),
+            "remaining_deferred": len(_deferred_tools) - len(_all_activated_tools()),
+            "note": (
+                f"Found {len(tool_defs)} tool(s) matching '{query}'. "
+                "They are now available — call them in your next response."
+            ),
+        })
+
+    # Register in a core toolset so it's always available
+    registry.register(
+        name="search_mcp_tools",
+        toolset="hermes-mcp-search",
+        schema=schema,
+        handler=_handler,
+        is_async=False,
+        description=schema["description"],
+    )
+
+    # Create toolset and inject into hermes-* umbrellas
+    TOOLSETS["hermes-mcp-search"] = {
+        "description": "MCP tool search (deferred loading)",
+        "tools": ["search_mcp_tools"],
+        "includes": [],
+    }
+    for ts_name, ts in TOOLSETS.items():
+        if ts_name.startswith("hermes-") and ts_name != "hermes-mcp-search":
+            if "search_mcp_tools" not in ts["tools"]:
+                ts["tools"].append("search_mcp_tools")
+
+    logger.info("Registered search_mcp_tools (%d tools deferred)", len(_deferred_tools))
+
+
+def check_tools_dirty() -> bool:
+    """Check and clear the tools-dirty flag.
+
+    Called by ``run_agent`` after tool execution to know whether to rebuild
+    ``self.tools``.  The flag is global (not per-session) — a spurious
+    rebuild in a concurrent session is harmless since each session applies
+    its own filter via ``_apply_mcp_session_filter``.
+    """
+    global _tools_dirty
+    with _lock:
+        if _tools_dirty:
+            _tools_dirty = False
+            return True
+        return False
+
+
+def get_deferred_tool_count() -> int:
+    """Return number of tools currently deferred (not yet activated by any session)."""
+    with _lock:
+        return max(0, len(_deferred_tools) - len(_all_activated_tools()))
+
+
+def get_session_filter(session_id: str) -> Optional[set]:
+    """Return the set of MCP tool names activated for *session_id*.
+
+    Returns ``None`` when deferred loading is not active (caller should
+    not filter).  Returns an empty set when deferred loading is active
+    but the session has not yet activated any tools.
+
+    Used by ``run_agent`` to post-filter ``self.tools`` so that each
+    session only sees ``search_mcp_tools`` + its own activated tools.
+    """
+    if not _deferred_tools:
+        return None
+    with _lock:
+        return set(_session_activated.get(session_id, set()))
+
+
+def cleanup_session(session_id: str) -> None:
+    """Remove a session's activation record.
+
+    Tools stay in the global registry as long as at least one other
+    session still references them.  Tools with no remaining references
+    are unregistered.
+
+    **Integration point** — not called automatically.  The gateway
+    should call this when a session expires or is reset.
+    """
+    with _lock:
+        removed_names = _session_activated.pop(session_id, set())
+        if not removed_names:
+            return
+
+        # Determine which tools are no longer referenced by ANY session
+        still_active = _all_activated_tools()
+        orphaned = removed_names - still_active
+
+    if orphaned:
+        from tools.registry import registry
+        from toolsets import TOOLSETS
+
+        for name in orphaned:
+            registry.unregister(name)
+
+        to_delete = []
+        for ts_name, ts in TOOLSETS.items():
+            desc = str(ts.get("description", ""))
+            if desc.startswith("MCP tools (activated"):
+                ts["tools"] = [t for t in ts["tools"] if t not in orphaned]
+                if not ts["tools"]:
+                    to_delete.append(ts_name)
+            elif ts_name.startswith("mcp-") or ts_name.startswith("hermes-"):
+                ts["tools"] = [t for t in ts["tools"] if t not in orphaned]
+                if ts_name.startswith("mcp-") and not ts["tools"]:
+                    to_delete.append(ts_name)
+        for ts_name in to_delete:
+            del TOOLSETS[ts_name]
+
+    logger.info("Cleaned up session %s — %d tool(s) released, %d orphaned & unregistered",
+                session_id, len(removed_names), len(orphaned))
+
+
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
 
@@ -1693,6 +2129,17 @@ def discover_mcp_tools() -> List[str]:
         if failed_count:
             summary += f" ({failed_count} failed)"
         logger.info(summary)
+
+    # Deferred tool loading: if too many MCP tools, swap them for a single
+    # search_mcp_tools meta-tool to keep per-request context small.
+    if all_tools and _should_defer_tools(len(all_tools)):
+        deferred_count = _defer_all_mcp_tools()
+        if deferred_count:
+            _register_search_tool()
+            logger.info(
+                "  MCP tool search enabled: %d tool(s) deferred, use search_mcp_tools to discover",
+                deferred_count,
+            )
 
     # Return ALL registered tools (existing + newly discovered)
     return _existing_tool_names()

@@ -297,6 +297,36 @@ mcp-<server>
 
 That makes MCP servers easier to reason about at the toolset level.
 
+## Deferred tool loading (Tool Search)
+
+When many MCP servers are configured, the total number of tool schemas can consume a large portion of the context window — or push requests into a higher billing tier. Hermes can automatically defer MCP tools and replace them with a single `search_mcp_tools` meta-tool that the agent uses to discover and activate tools on demand.
+
+### When it triggers
+
+By default (`enabled: auto`), deferred loading activates when the total MCP tool count exceeds 20. You can control this in `config.yaml`:
+
+```yaml
+mcp_tool_search:
+  enabled: auto    # auto | true | false
+  threshold: 20    # tool count trigger for auto mode
+```
+
+### How the agent uses it
+
+The agent sees `search_mcp_tools` in its tool list and calls it with keywords:
+
+```text
+search_mcp_tools(query="stripe payments")
+```
+
+The handler returns matching tool names, descriptions, and parameter schemas. Matched tools are activated and appear in the tool list from the next turn onward. Activated tools persist within the current session — they do not need to be searched again between turns. Each parallel session (thread, cron job, background agent) has its own independent set of activated tools. Subagents inherit the parent session's activated tools.
+
+### Interaction with per-server filtering
+
+Deferred loading runs after per-server `include`/`exclude` filtering. If you whitelist 5 tools on one server and that brings the total below the threshold, deferred loading will not trigger.
+
+For full config details, see the [MCP Config Reference](/docs/reference/mcp-config-reference#deferred-tool-loading-tool-search).
+
 ## Security model
 
 ### Stdio env filtering
@@ -392,6 +422,7 @@ Possible causes:
 - your filter config excluded the tools
 - the utility capability does not exist on that server
 - the server is disabled with `enabled: false`
+- deferred tool loading is active — the agent needs to call `search_mcp_tools` first (check logs for "MCP tool search enabled")
 
 If you are intentionally filtering, this is expected.
 
@@ -406,6 +437,7 @@ This is intentional and keeps the tool list honest.
 ## Related docs
 
 - [Use MCP with Hermes](/docs/guides/use-mcp-with-hermes)
+- [MCP Config Reference](/docs/reference/mcp-config-reference)
 - [CLI Commands](/docs/reference/cli-commands)
 - [Slash Commands](/docs/reference/slash-commands)
 - [FAQ](/docs/reference/faq)
