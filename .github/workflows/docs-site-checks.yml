@@ -9,6 +9,7 @@ on:
 
 jobs:
   docs-site-checks:
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
